@@ -9,11 +9,11 @@ export async function createTransport(router, userId) {
     enableUdp: true,
     enableTcp: true,
     preferUdp: true,
-    initialAvailableOutgoingBitrate: 1000000,
-    minimumAvailableOutgoingBitrate: 600000,
-    maxIncomingBitrate: 1500000,
-    enableSctp: true,
-    numSctpStreams: { OS: 1024, MIS: 1024 },
+    // SCTP disabled — data channels not needed for audio/video-only rooms
+    enableSctp: false,
+    // Simulcast manages per-consumer rates; these are per-transport caps
+    initialAvailableOutgoingBitrate: 1_000_000,
+    minimumAvailableOutgoingBitrate: 100_000,
   });
 
   transport.appData = { userId };

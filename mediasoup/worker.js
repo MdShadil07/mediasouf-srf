@@ -10,6 +10,9 @@
  */
 import * as mediasoup from 'mediasoup';
 import os from 'os';
+import { setHomeRouter, addSatelliteRouter, cleanupRoomPipes } from './pipeManager.js';
+
+// ROUTER_MEDIA_CODECS is already exported below via `export const`
 
 const workers = [];
 let nextWorkerIndex = 0;
@@ -18,7 +21,7 @@ let nextWorkerIndex = 0;
 // All codecs pre-declared so every router can handle whichever codec the client
 // negotiates. VP9 + H264 provide much better compression than VP8 alone, which
 // is critical at scale (lower bandwidth per consumer = more users supportable).
-const ROUTER_MEDIA_CODECS = [
+export const ROUTER_MEDIA_CODECS = [
   // ── Audio ──
   {
     kind: 'audio',
@@ -92,11 +95,27 @@ export const TRANSPORT_CONFIG = {
   enableUdp: true,
   enableTcp: true,           // TCP fallback (for enterprise firewalls)
   preferUdp: true,           // UDP first (lower latency)
-  enableSctp: false,         // Disable SCTP (data channel) for audio/video only rooms
-  // Bandwidth limits — generous limits to avoid throttling at scale
-  initialAvailableOutgoingBitrate: 600_000,
+  enableSctp: false,         // Disabled — audio/video-only rooms don't need data channels
+  // Generous bandwidth limits per transport — simulcast manages per-consumer rates
+  initialAvailableOutgoingBitrate: 1_000_000,
   minimumAvailableOutgoingBitrate: 100_000,
   maxSctpMessageSize: 262144,
+};
+
+// ─── Simulcast encoding layers ────────────────────────────────────────────────
+// Three spatial layers for video:
+//   low  → 180p  @ ≤100 kbps  (thumbnail view, most consumers in a 500-user room)
+//   mid  → 360p  @ ≤300 kbps  (standard grid view)
+//   high → 720p  @ ≤900 kbps  (featured/pinned speaker)
+// The SFU selects which layer to forward per-consumer, massively reducing egress.
+export const VIDEO_SIMULCAST_ENCODINGS = [
+  { rid: 'r0', maxBitrate: 100_000, scalabilityMode: 'S1T3', scaleResolutionDownBy: 4 },
+  { rid: 'r1', maxBitrate: 300_000, scalabilityMode: 'S1T3', scaleResolutionDownBy: 2 },
+  { rid: 'r2', maxBitrate: 900_000, scalabilityMode: 'S1T3', scaleResolutionDownBy: 1 },
+];
+
+export const VIDEO_PRODUCER_CODEC_OPTIONS = {
+  videoGoogleStartBitrate: 1000,
 };
 
 // ─── Worker lifecycle ────────────────────────────────────────────────────────
@@ -146,39 +165,92 @@ export async function initializeWorkers() {
  * Round-robin worker selection ensures even load distribution.
  * In a 500-user room with 8 cores, each core handles ~62 users worth of media.
  */
-function getNextWorker() {
+export function getNextWorker() {
   if (workers.length === 0) throw new Error('No mediasoup workers available');
   const worker = workers[nextWorkerIndex % workers.length];
   nextWorkerIndex = (nextWorkerIndex + 1) % workers.length;
   return worker;
 }
 
+/** Returns the full worker array (for multi-worker satellite logic in socket.js) */
+export function getWorkers() {
+  return workers;
+}
+
 // ─── Router management ───────────────────────────────────────────────────────
 
-/** roomId → mediasoup Router */
+/** roomId → mediasoup home Router (the hub for that room) */
 const routers = new Map();
 
 /**
  * Get or create a Router for a room.
- * One Router per room — all participants in the same room share the same Router,
- * which allows the SFU to efficiently forward RTP packets between them.
+ *
+ * For the FIRST user in a room  → create a "home" router on the next available worker
+ *   and register it as the room's primary pipeline hub.
+ * For SUBSEQUENT users on a DIFFERENT worker → create a per-worker "satellite" router
+ *   and register it; the socket.js produce handler will pipe producers across via pipeManager.
+ * For SUBSEQUENT users on the SAME worker as the home → reuse the home router directly.
  */
-export async function getOrCreateRouter(roomId) {
+export async function getOrCreateRouter(roomId, preferSameWorkerAsHome = false) {
   await initializeWorkers();
 
-  if (routers.has(roomId)) return routers.get(roomId);
+  // Return existing home router if the caller just needs any router for this room
+  if (routers.has(roomId) && preferSameWorkerAsHome) {
+    return routers.get(roomId);
+  }
 
-  const worker = getNextWorker();
-  const router = await worker.createRouter({ mediaCodecs: ROUTER_MEDIA_CODECS });
+  // Home router not yet created — create it
+  if (!routers.has(roomId)) {
+    const worker = getNextWorker();
+    const router = await worker.createRouter({ mediaCodecs: ROUTER_MEDIA_CODECS });
+    router._workerPid = worker.pid; // tag for satellite comparison
 
+    router.on('workerclose', () => {
+      console.warn(`[SFU Router] Home router for room ${roomId} closed (worker died). Removing.`);
+      routers.delete(roomId);
+      cleanupRoomPipes(roomId);
+    });
+
+    routers.set(roomId, router);
+    setHomeRouter(roomId, router); // Register as the home/hub router
+    console.log(`[SFU Router] Home router created for room ${roomId} on worker pid=${worker.pid} | Active rooms: ${routers.size}`);
+    return router;
+  }
+
+  // Home already exists — return it
+  return routers.get(roomId);
+}
+
+/**
+ * Create a dedicated satellite router for a room on a DIFFERENT worker than the home router.
+ * Called once per new worker that needs to serve participants in this room.
+ * Returns { router, isNew } so the caller knows whether to pipe existing producers.
+ */
+export async function createSatelliteRouter(roomId) {
+  await initializeWorkers();
+  const homeRouter = routers.get(roomId);
+  if (!homeRouter) return { router: await getOrCreateRouter(roomId), isNew: false };
+
+  // Single worker — satellite IS home
+  if (workers.length <= 1) return { router: homeRouter, isNew: false };
+
+  // Round-robin, skipping the home router's worker
+  const homeWorkerPid = homeRouter._workerPid;
+  let targetWorker = null;
+  for (let i = 0; i < workers.length; i++) {
+    const candidate = workers[nextWorkerIndex % workers.length];
+    nextWorkerIndex = (nextWorkerIndex + 1) % workers.length;
+    if (candidate.pid !== homeWorkerPid) { targetWorker = candidate; break; }
+  }
+  if (!targetWorker) targetWorker = workers[nextWorkerIndex % workers.length];
+
+  const router = await targetWorker.createRouter({ mediaCodecs: ROUTER_MEDIA_CODECS });
+  router._workerPid = targetWorker.pid;
   router.on('workerclose', () => {
-    console.warn(`[SFU Router] Router for room ${roomId} closed (worker died). Removing.`);
-    routers.delete(roomId);
+    console.warn(`[SFU Router] Satellite router for room ${roomId} closed`);
   });
-
-  routers.set(roomId, router);
-  console.log(`[SFU Router] Created router for room ${roomId} on worker pid=${worker.pid} | Active rooms: ${routers.size}`);
-  return router;
+  console.log(`[SFU Router] Satellite router for room ${roomId} on worker pid=${targetWorker.pid}`);
+  return { router, isNew: true };
 }
 
 export function closeRoomRouter(roomId) {
@@ -186,6 +258,7 @@ export function closeRoomRouter(roomId) {
   if (router) {
     router.close();
     routers.delete(roomId);
+    cleanupRoomPipes(roomId); // Also clean up all pipe topology for this room
     console.log(`[SFU Router] Closed router for room ${roomId} | Active rooms: ${routers.size}`);
   }
 }

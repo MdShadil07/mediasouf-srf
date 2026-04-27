@@ -52,11 +52,12 @@ USER sfu
 # Port 3001: Socket.IO signaling (TCP/HTTP)
 EXPOSE 3001
 
-# UDP/TCP 10000-59999: mediasoup WebRTC media ports
-# NOTE: These must be exposed on the HOST (not just Docker).
-# Use: docker run --network=host   (Linux)
-# Or:  -p 10000-59999:10000-59999/udp (limited by Docker on macOS/Windows)
-EXPOSE 10000-10100/udp
+# UDP 10000-59999: mediasoup WebRTC media ports (50,000 ports = ~12,500 concurrent transports)
+# PRODUCTION (Linux): always use --network=host — Docker NAT cannot map 50k ports efficiently:
+#   docker run --network=host --env-file .env.production cognitospeak-sfu
+# LOCAL DEV ONLY (macOS/Windows, limited range):
+#   docker run -p 10000-10200:10000-10200/udp -p 3001:3001 cognitospeak-sfu
+EXPOSE 10000-59999/udp
 
 # ─── Health check ─────────────────────────────────────────────────────────────
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
