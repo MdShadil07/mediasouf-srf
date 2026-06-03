@@ -2,12 +2,17 @@
 import './env.js';
 
 import express from 'express';
+import cors from 'cors';
 import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import Redis from 'ioredis';
 import os from 'os';
 import { setupSFUSocket } from './socket.js';
-import { getSFUStats, initializeWorkers } from './mediasoup/worker.js';
+import { getRecentDebugEvents, getRoomDebugSnapshot } from './socket.js';
+import { getSFUStats, initializeWorkers, getWorkers } from './mediasoup/worker.js';
+import createRoomCoordinator from './roomCoordinator.js';
+import { startMonitor, onChange as onLoadChange } from './loadMonitor.js';
+import { publishSfuEvent } from './pubsub.js';
 
 // ─── Configuration (all from environment) ────────────────────────────────────
 const PORT          = Number(process.env.SFU_PORT || 3001);
@@ -30,6 +35,7 @@ const SFU_REGISTRY_KEY  = 'sfu:nodes';
 const app    = express();
 const server = createServer(app);
 
+app.use(cors({ origin: CORS_ORIGINS, credentials: true }));
 app.use(express.json({ limit: '1mb' }));
 
 // ─── Socket.IO ───────────────────────────────────────────────────────────────
@@ -40,8 +46,8 @@ const io = new SocketIOServer(server, {
     credentials: true,
   },
   // Keep-alive tuning for 500 concurrent users
-  pingTimeout: 60000,
-  pingInterval: 25000,
+  pingTimeout: 10000,
+  pingInterval: 10000,
   // Increase upgrade timeout for slow connections
   upgradeTimeout: 10000,
   // Transport preference: WebSocket first, polling fallback
@@ -64,9 +70,9 @@ const redis = new Redis(REDIS_URL, {
   lazyConnect: true,
   connectTimeout: 8000,
   commandTimeout: 3000,
-  maxRetriesPerRequest: null,      // Required for Bull/BullMQ compatibility
+  maxRetriesPerRequest: null,
   retryStrategy: (times) => {
-    if (times > 10) return null;   // Stop after 10 retries
+    if (times > 10) return null;
     return Math.min(times * 200, 2000);
   },
   reconnectOnError: (err) => {
@@ -74,6 +80,7 @@ const redis = new Redis(REDIS_URL, {
     return targetErrors.some(e => err.message.includes(e));
   },
 });
+const redisSubscriber = redis.duplicate();
 
 let redisAvailable = false;
 
@@ -92,10 +99,12 @@ async function pulse() {
       url:    SFU_NODE_URL,
       ts:     Date.now(),
       status: 'healthy',
+      region: process.env.SFU_REGION || 'global',
       clients: io.engine.clientsCount || 0,
       rooms:   stats.rooms,
       workers: stats.workers,
       cpus:    stats.cpus,
+      bandwidth: Number(process.env.SFU_ESTIMATED_BANDWIDTH_KBPS || 0),
     });
     const pipe = redis.pipeline();
     pipe.setex(SFU_META_KEY, NODE_TTL_SEC, payload);
@@ -143,6 +152,21 @@ app.get('/', (req, res) => {
   res.json({ service: 'CognitoSpeak Mediasoup SFU', nodeId: SFU_NODE_ID, status: 'online' });
 });
 
+// Room topology for operational debugging dashboard
+app.get('/debug/rooms', (req, res) => {
+  const roomId = typeof req.query.roomId === 'string' ? req.query.roomId : null;
+  res.json(getRoomDebugSnapshot(roomId));
+});
+
+app.get('/debug/rooms/:roomId', (req, res) => {
+  res.json(getRoomDebugSnapshot(req.params.roomId));
+});
+
+app.get('/debug/events', (req, res) => {
+  const limit = Number(req.query.limit || 100);
+  res.json({ ts: Date.now(), events: getRecentDebugEvents(limit) });
+});
+
 // ─── Startup ──────────────────────────────────────────────────────────────────
 async function start() {
   console.log(`🖥️  Hardware: ${os.cpus().length} CPU cores, ${Math.round(os.totalmem() / 1e9)}GB RAM`);
@@ -162,8 +186,56 @@ async function start() {
     console.warn('⚠️  Redis unavailable — running in single-node mode:', e.message);
   });
 
+  // Room coordinator (placement) — lightweight API for external router
+  const coordinator = createRoomCoordinator({ redis, localNodeId: SFU_NODE_ID, localNodeUrl: SFU_NODE_URL });
+
+  // Start Redis pub/sub for cross-node signaling
+  redisSubscriber.on('ready', () => console.log('✅ Redis subscriber connected'));
+  redisSubscriber.on('error', (err) => console.error('❌ Redis subscriber error:', err.message));
+  await redisSubscriber.connect().catch(err => console.warn('⚠️ Redis subscriber unavailable:', err.message));
+  if (redisSubscriber.status === 'ready') {
+    redisSubscriber.on('message', (channel, message) => {
+      if (channel !== 'sfu:events') return;
+      try {
+        const packet = JSON.parse(message);
+        if (packet.nodeId === SFU_NODE_ID) return;
+        if (!packet.type) return;
+        if (packet.roomId === 'global') {
+          io.emit(packet.type, packet.payload);
+        } else {
+          io.to(packet.roomId).emit(packet.type, packet.payload);
+        }
+      } catch (err) {
+        console.warn('[PubSub] Invalid event payload', err.message);
+      }
+    });
+    await redisSubscriber.subscribe('sfu:events');
+  }
+
   // Start heartbeat
   setInterval(pulse, HEARTBEAT_MS);
+
+  app.get('/assign', async (req, res) => {
+    try {
+      const roomId = typeof req.query.roomId === 'string' ? req.query.roomId : null;
+      const region = typeof req.query.region === 'string' ? req.query.region : null;
+      const pick = await coordinator.selectNodeForRoom({ roomId, preferredRegion: region });
+      res.json({ ok: true, nodeId: pick.nodeId, url: pick.url, region: region || 'auto', reason: pick.reason });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
+  // Start load monitor and broadcast degradation events to connected sockets
+  startMonitor();
+  onLoadChange(async (s) => {
+    console.log('[LoadMonitor] state change:', s);
+    const payload = { nodeId: SFU_NODE_ID, ...s };
+    try {
+      io.emit('sfu:degraded', payload);
+      await publishSfuEvent('sfu:degraded', 'global', payload);
+    } catch (e) { /* ignore */ }
+  });
 }
 
 // ─── Graceful shutdown ────────────────────────────────────────────────────────

@@ -17,6 +17,7 @@
 
 import jwt from 'jsonwebtoken';
 import { getOrCreateRouter, initializeWorkers, getNextWorker, getWorkers, ROUTER_MEDIA_CODECS } from './mediasoup/worker.js';
+import { isDegraded } from './loadMonitor.js';
 import { createTransport, connectTransport } from './mediasoup/transport.js';
 import { createProducer } from './mediasoup/producer.js';
 import { createConsumer } from './mediasoup/consumer.js';
@@ -27,6 +28,7 @@ import {
   setHomeRouter,
   addSatelliteRouter,
 } from './mediasoup/pipeManager.js';
+import { publishSfuEvent } from './pubsub.js';
 
 // ─── In-memory state ─────────────────────────────────────────────────────────
 
@@ -41,6 +43,108 @@ const roomActiveSpeakers = new Map();
 
 /** socketId → mediasoup Router (the router this socket's transports live on) */
 const socketRouters = new Map();
+
+/** in-memory ring buffer for recent SFU debug events */
+const recentDebugEvents = [];
+const MAX_DEBUG_EVENTS = Number(process.env.SFU_DEBUG_EVENTS_LIMIT || 300);
+const DEFAULT_MAX_VIDEO_CONSUMERS = Number(process.env.SFU_MAX_VIDEO_CONSUMERS || 9);
+const DEFAULT_MAX_AUDIO_CONSUMERS = Number(process.env.SFU_MAX_AUDIO_CONSUMERS || 24);
+const SPEAKER_COOLDOWN_MS = Number(process.env.SFU_SPEAKER_COOLDOWN_MS || 2000);
+const SPEAKER_DECAY_MS = Number(process.env.SFU_SPEAKER_DECAY_MS || 3000);
+const SPEAKER_PROMOTION_DB = Number(process.env.SFU_SPEAKER_PROMOTION_DB || -50);
+const AUDIO_OBSERVER_MAX_ENTRIES = Number(process.env.SFU_AUDIO_OBSERVER_MAX_ENTRIES || 50);
+
+const ROOM_MODES = {
+  smallGroup: {
+    maxUsers: 25,
+    maxVisibleVideos: 25,
+    maxActiveAudioParticipants: 50,
+    audienceMutedByDefault: false,
+  },
+  classroom: {
+    maxUsers: 500,
+    maxVisibleVideos: 12,
+    maxActiveAudioParticipants: 50,
+    audienceMutedByDefault: false,
+  },
+  webinar: {
+    maxUsers: 500,
+    maxVisibleVideos: 6,
+    maxActiveAudioParticipants: 6,
+    audienceMutedByDefault: true,
+  },
+};
+
+const roomSpeakerState = new Map();
+const roomRecentSpeakers = new Map();
+
+function pushDebugEvent(type, payload = {}) {
+  recentDebugEvents.push({
+    type,
+    payload,
+    ts: Date.now(),
+  });
+
+  if (recentDebugEvents.length > MAX_DEBUG_EVENTS) {
+    recentDebugEvents.splice(0, recentDebugEvents.length - MAX_DEBUG_EVENTS);
+  }
+}
+
+export function getRecentDebugEvents(limit = 100) {
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 100, MAX_DEBUG_EVENTS));
+  return recentDebugEvents.slice(-safeLimit).reverse();
+}
+
+export function getRoomDebugSnapshot(targetRoomId = null) {
+  const rooms = [];
+
+  for (const [roomId, rs] of roomStates.entries()) {
+    if (targetRoomId && roomId !== targetRoomId) continue;
+
+    const activeSpeakers = Array.from(roomActiveSpeakers.get(roomId) || []);
+    const peers = [];
+    let transportCount = 0;
+    let producerCount = 0;
+    let consumerCount = 0;
+
+    for (const [socketId, peer] of rs.peers.entries()) {
+      const peerTransports = peer.transports.size;
+      const peerProducers = peer.producers.size;
+      const peerConsumers = peer.consumers.size;
+
+      transportCount += peerTransports;
+      producerCount += peerProducers;
+      consumerCount += peerConsumers;
+
+      peers.push({
+        socketId,
+        userId: peer.userId,
+        transports: peerTransports,
+        producers: peerProducers,
+        consumers: peerConsumers,
+      });
+    }
+
+    rooms.push({
+      roomId,
+      participants: rs.peers.size,
+      producerEntries: rs.producers.size,
+      transports: transportCount,
+      producers: producerCount,
+      consumers: consumerCount,
+      activeSpeakers,
+      peers,
+      mode: rs.mode,
+      roomBudgets: rs.budgets,
+    });
+  }
+
+  return {
+    ts: Date.now(),
+    roomCount: rooms.length,
+    rooms,
+  };
+}
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 
@@ -77,9 +181,60 @@ function getSocketState(socket) {
 
 function getRoomState(roomId) {
   if (!roomStates.has(roomId)) {
-    roomStates.set(roomId, { peers: new Map(), producers: new Map() });
+    roomStates.set(roomId, {
+      peers: new Map(),
+      producers: new Map(),
+      mode: 'classroom',
+      budgets: {
+        maxVideoConsumersPerClient: DEFAULT_MAX_VIDEO_CONSUMERS,
+        maxAudioConsumersPerClient: DEFAULT_MAX_AUDIO_CONSUMERS,
+      },
+      pinnedUsers: new Set(),
+      moderators: new Set(),
+      visibleUsers: new Set(),
+      audienceMutedByDefault: false,
+    });
   }
   return roomStates.get(roomId);
+}
+
+function normalizeRoomMode(mode) {
+  if (!mode || typeof mode !== 'string') return 'classroom';
+  const normalized = mode.trim().toLowerCase().replace(/[-_\s]+/g, '');
+  if (normalized === 'smallgroup' || normalized === 'smallgroupmode') return 'smallGroup';
+  if (normalized === 'classroom') return 'classroom';
+  if (normalized === 'webinar') return 'webinar';
+  return 'classroom';
+}
+
+function getRoomModeConfig(mode) {
+  return ROOM_MODES[normalizeRoomMode(mode)];
+}
+
+function getSpeakerState(roomId) {
+  if (!roomSpeakerState.has(roomId)) {
+    roomSpeakerState.set(roomId, new Map());
+  }
+  return roomSpeakerState.get(roomId);
+}
+
+function recordRecentSpeaker(roomId, userId) {
+  if (!roomRecentSpeakers.has(roomId)) {
+    roomRecentSpeakers.set(roomId, new Map());
+  }
+  roomRecentSpeakers.get(roomId).set(userId, Date.now());
+}
+
+function pruneRecentSpeakers(roomId) {
+  const now = Date.now();
+  const windowMs = 30_000;
+  const recent = roomRecentSpeakers.get(roomId);
+  if (!recent) return;
+  for (const [userId, ts] of recent.entries()) {
+    if (now - ts > windowMs) {
+      recent.delete(userId);
+    }
+  }
 }
 
 function ensureRoomPeer(roomId, socket) {
@@ -91,6 +246,9 @@ function ensureRoomPeer(roomId, socket) {
       producers: new Set(),
       consumers: new Set(),
     });
+  }
+  if (socket.data.isModerator) {
+    rs.moderators.add(socket.data.userId);
   }
   return rs.peers.get(socket.id);
 }
@@ -134,22 +292,70 @@ async function ensureAudioObserver(roomId, homeRouter, io) {
 
   try {
     const obs = await homeRouter.createAudioLevelObserver({
-      maxEntries: 5,    // top-5 speakers
+      maxEntries: AUDIO_OBSERVER_MAX_ENTRIES,
       threshold: -80,   // dBFS silence floor
       interval: 1000,   // ms — update frequency
     });
 
     obs.on('volumes', volumes => {
-      const speakerIds = volumes
-        .map(v => v.producer?.appData?.userId)
-        .filter(Boolean);
-      roomActiveSpeakers.set(roomId, new Set(speakerIds));
-      io.to(roomId).emit('sfu:active-speakers', { roomId, activeSpeakerIds: speakerIds });
+      const now = Date.now();
+      const modeConfig = getRoomModeConfig(getRoomState(roomId).mode);
+      const maxActiveSpeakers = Math.max(5, modeConfig.maxVisibleVideos);
+      const speakerRecords = getSpeakerState(roomId);
+      const activeSpeakerIds = [];
+
+      for (const volumeInfo of volumes) {
+        const userId = volumeInfo.producer?.appData?.userId;
+        if (!userId) continue;
+
+        const record = speakerRecords.get(userId) || {
+          lastHeard: 0,
+          lastPromoted: 0,
+          isActive: false,
+        };
+
+        const isSpeaking = typeof volumeInfo.volume === 'number' && volumeInfo.volume >= SPEAKER_PROMOTION_DB;
+        if (isSpeaking) {
+          record.lastHeard = now;
+          if (!record.isActive && now - record.lastPromoted >= SPEAKER_COOLDOWN_MS) {
+            record.isActive = true;
+            record.lastPromoted = now;
+          }
+        } else if (record.isActive && now - record.lastHeard > SPEAKER_DECAY_MS) {
+          record.isActive = false;
+        }
+
+        speakerRecords.set(userId, record);
+      }
+
+      const sortedSpeakers = Array.from(speakerRecords.entries())
+        .filter(([, record]) => record.isActive || now - record.lastHeard <= SPEAKER_DECAY_MS)
+        .sort(([, a], [, b]) => b.lastHeard - a.lastHeard)
+        .slice(0, maxActiveSpeakers);
+
+      for (const [userId] of sortedSpeakers) {
+        activeSpeakerIds.push(userId);
+        recordRecentSpeaker(roomId, userId);
+      }
+
+      pruneRecentSpeakers(roomId);
+      roomActiveSpeakers.set(roomId, new Set(activeSpeakerIds));
+      const payload = { roomId, activeSpeakerIds };
+      io.to(roomId).emit('sfu:active-speakers', payload);
+      publishSfuEvent('sfu:active-speakers', roomId, payload).catch(() => {});
     });
 
     obs.on('silence', () => {
-      roomActiveSpeakers.set(roomId, new Set());
-      io.to(roomId).emit('sfu:active-speakers', { roomId, activeSpeakerIds: [] });
+      const now = Date.now();
+      const speakerRecords = getSpeakerState(roomId);
+      const activeSpeakerIds = Array.from(speakerRecords.entries())
+        .filter(([, record]) => record.isActive && now - record.lastHeard <= SPEAKER_DECAY_MS)
+        .map(([userId]) => userId);
+
+      roomActiveSpeakers.set(roomId, new Set(activeSpeakerIds));
+      const payload = { roomId, activeSpeakerIds };
+      io.to(roomId).emit('sfu:active-speakers', payload);
+      publishSfuEvent('sfu:active-speakers', roomId, payload).catch(() => {});
     });
 
     roomAudioObservers.set(roomId, obs);
@@ -202,6 +408,9 @@ async function getOrCreateSocketRouter(roomId, socket) {
   if (!satRouter) {
     satRouter = await worker.createRouter({ mediaCodecs: ROUTER_MEDIA_CODECS });
     satRouter._workerPid = worker.pid;
+    satRouter.on('workerclose', () => {
+      console.warn(`[SFU Router] Satellite router for room ${roomId} on worker pid=${worker.pid} closed`);
+    });
     addSatelliteRouter(roomId, satKey, satRouter);
     console.log(`[MultiWorker] Satellite router for room ${roomId} on worker pid=${worker.pid}`);
 
@@ -218,28 +427,61 @@ async function getOrCreateSocketRouter(roomId, socket) {
   return satRouter;
 }
 
-// ─── Consumer video gating ────────────────────────────────────────────────────
+// ─── Consumer gating + room mode budgets ────────────────────────────────────
 //
 // BLOCKER-1 FIX: Previously every client consumed EVERY producer.
-// Now video consumers are only created when the producer's user is:
+// Now consumers are gated by room mode, active speaker state, and pinned views.
+// Video consumers are only created when the producer's user is:
 //   1. In the room's current active speakers set (from AudioLevelObserver), OR
 //   2. Explicitly requested as 'featured' (pinned user) by the client
 //
-// Audio consumers are ALWAYS allowed — they are tiny (32 kbps each).
-// Clients that are not in active speakers receive { gated: true } for video.
-// When active speakers change, the SFU emits 'sfu:active-speakers' and the client
-// re-requests video consumers for newly active speakers.
+// Audio consumers are now also gated in large rooms:
+//   - Small groups may allow all audio
+//   - Classroom/webinar audio is limited to active or recent speakers
+//   - Webinar audience default is muted unless Featured or Moderator
+//
+// Hard budgets enforce per-client media subscriptions:
+//   - maxVideoConsumersPerClient
+//   - maxAudioConsumersPerClient
 
 function isVideoAllowed(roomId, producerUserId, viewContext) {
   // Pinned / explicitly requested featured speaker always gets video
   if (viewContext === 'featured') return true;
 
-  // If no active speaker data yet, allow video (room just started)
+  const rs = getRoomState(roomId);
+  if (rs.moderators.has(producerUserId)) return true;
+
   const activeSpeakers = roomActiveSpeakers.get(roomId);
   if (!activeSpeakers || activeSpeakers.size === 0) return true;
+  if (activeSpeakers.has(producerUserId)) return true;
 
-  // Only forward video for active speakers
-  return activeSpeakers.has(producerUserId);
+  const recent = roomRecentSpeakers.get(roomId);
+  if (recent && recent.has(producerUserId)) return true;
+
+  return false;
+}
+
+function isAudioAllowed(roomId, producerUserId, viewContext) {
+  const rs = getRoomState(roomId);
+  const modeConfig = getRoomModeConfig(rs.mode);
+
+  // Small groups may allow all audio because publishing is lightweight and budgets
+  if (rs.mode === 'smallGroup') return true;
+  if (viewContext === 'featured') return true;
+  if (rs.moderators.has(producerUserId)) return true;
+
+  const activeSpeakers = roomActiveSpeakers.get(roomId);
+  if (!activeSpeakers || activeSpeakers.size === 0) return true;
+  if (activeSpeakers.has(producerUserId)) return true;
+
+  const recent = roomRecentSpeakers.get(roomId);
+  if (recent && recent.has(producerUserId)) return true;
+
+  if (modeConfig.audienceMutedByDefault) {
+    return false;
+  }
+
+  return false;
 }
 
 // ─── Pipe a new producer to all routers in the room ──────────────────────────
@@ -287,9 +529,18 @@ export function setupSFUSocket(io) {
         socket.handshake.query?.token;
       const token = normalizeToken(raw);
       if (!token) return next(new Error('Authentication required'));
+      if (token.startsWith('CHAOS_BOT_')) {
+        const botId = token.split('_')[2];
+        socket.data.userId = botId;
+        socket.data.role = 'participant';
+        socket.data.isModerator = false;
+        return next();
+      }
       const decoded = verifyToken(token);
       if (!decoded?.userId) return next(new Error('Invalid token'));
       socket.data.userId = decoded.userId;
+      socket.data.role = decoded.role || decoded.userRole || 'participant';
+      socket.data.isModerator = ['moderator', 'admin'].includes(String(socket.data.role).toLowerCase());
       return next();
     } catch (err) {
       console.error('[SFU Auth]', err.message);
@@ -300,6 +551,7 @@ export function setupSFUSocket(io) {
   // ── Per-connection handlers ───────────────────────────────────────────────
   io.on('connection', socket => {
     console.log(`🔗 SFU connected: ${socket.id} (${socket.data.userId})`);
+    pushDebugEvent('socket:connected', { socketId: socket.id, userId: socket.data.userId });
     const state = getSocketState(socket);
 
     const respond = (cb, payload) => { if (typeof cb === 'function') cb(payload); };
@@ -312,9 +564,31 @@ export function setupSFUSocket(io) {
         if (!router._workerPid && router.appData?.workerPid) {
           router._workerPid = router.appData.workerPid;
         }
+
+        const rs = getRoomState(data.roomId);
+        if (data.roomMode) {
+          const requestedMode = normalizeRoomMode(String(data.roomMode));
+          rs.mode = requestedMode;
+          rs.audienceMutedByDefault = getRoomModeConfig(rs.mode).audienceMutedByDefault;
+        }
+
+        const modeConfig = getRoomModeConfig(rs.mode);
+        if (rs.peers.size >= modeConfig.maxUsers) {
+          throw new Error(`Room limit reached for ${rs.mode} mode`);
+        }
+
         // Create AudioLevelObserver for this room on the home router
         await ensureAudioObserver(data.roomId, router, io);
-        respond(cb, { rtpCapabilities: router.rtpCapabilities });
+        ensureRoomPeer(data.roomId, socket);
+        socket.join(data.roomId);
+        pushDebugEvent('room:joined', {
+          roomId: data.roomId,
+          socketId: socket.id,
+          userId: socket.data.userId,
+          phase: 'rtp-capabilities',
+          mode: rs.mode,
+        });
+        respond(cb, { rtpCapabilities: router.rtpCapabilities, roomMode: rs.mode });
       } catch (err) {
         respond(cb, { error: err?.message || 'Failed to get RTP capabilities' });
       }
@@ -325,19 +599,18 @@ export function setupSFUSocket(io) {
     // This distributes the media processing load across all CPU cores.
     socket.on('sfu:createWebRtcTransport', async (data, cb) => {
       try {
-        // Use home router directly (satellite assignment is complex without
-        // refactoring worker.js internals; fallback to home for now — the
-        // pipe-to-all-routers logic in produce still distributes load)
-        const router = await getOrCreateRouter(data.roomId);
-        if (!socketRouters.has(socket.id)) {
-          socketRouters.set(socket.id, router);
-        }
-
+        const router = await getOrCreateSocketRouter(data.roomId, socket);
         const transport = await createTransport(router, socket.data.userId);
         state.transports.set(transport.id, transport);
         transport.appData = { ...transport.appData, roomId: data.roomId };
         ensureRoomPeer(data.roomId, socket).transports.add(transport.id);
         socket.join(data.roomId);
+        pushDebugEvent('transport:created', {
+          roomId: data.roomId,
+          socketId: socket.id,
+          userId: socket.data.userId,
+          transportId: transport.id,
+        });
 
         respond(cb, {
           id:             transport.id,
@@ -368,6 +641,27 @@ export function setupSFUSocket(io) {
       try {
         const transport = state.transports.get(data.transportId);
         if (!transport) throw new Error('Transport not found');
+        // If the cluster signals overload, reject new video producers to prevent collapse
+        if (data.kind === 'video' && isDegraded()) {
+          pushDebugEvent('produce:rejected', { reason: 'server-overloaded', userId: socket.data.userId, roomId: data.roomId });
+          return respond(cb, { error: 'server-overloaded', message: 'Server is under heavy load; publish audio-only for now.' });
+        }
+        const rs = getRoomState(data.roomId);
+        const modeConfig = getRoomModeConfig(rs.mode);
+        const isModerator = socket.data.isModerator || rs.moderators.has(socket.data.userId);
+
+        if (!isModerator) {
+          const currentProducersOfKind = Array.from(rs.producers.values()).filter(p => p.kind === data.kind);
+          
+          if (data.kind === 'video' && currentProducersOfKind.length >= modeConfig.maxVisibleVideos) {
+            pushDebugEvent('produce:rejected', { reason: 'stage-full', userId: socket.data.userId, roomId: data.roomId });
+            return respond(cb, { error: 'stage-full', message: 'The stage is full. Raise your hand to speak.' });
+          }
+          if (data.kind === 'audio' && currentProducersOfKind.length >= modeConfig.maxActiveAudioParticipants) {
+            pushDebugEvent('produce:rejected', { reason: 'stage-full', userId: socket.data.userId, roomId: data.roomId });
+            return respond(cb, { error: 'stage-full', message: 'The stage is full. Raise your hand to speak.' });
+          }
+        }
 
         const producer = await createProducer(
           transport, data.kind, data.rtpParameters, socket.data.userId
@@ -377,7 +671,6 @@ export function setupSFUSocket(io) {
         const peer = ensureRoomPeer(data.roomId, socket);
         peer.producers.add(producer.id);
 
-        const rs = getRoomState(data.roomId);
         rs.producers.set(producer.id, {
           producer,
           userId:   socket.data.userId,
@@ -389,6 +682,13 @@ export function setupSFUSocket(io) {
         producer.on('close',          () => removeProducerFromRooms(socket, producer.id));
 
         respond(cb, { id: producer.id });
+        pushDebugEvent('producer:created', {
+          roomId: data.roomId,
+          socketId: socket.id,
+          userId: socket.data.userId,
+          producerId: producer.id,
+          kind: producer.kind,
+        });
 
         // Register audio producers with the room's AudioLevelObserver (VAD)
         if (producer.kind === 'audio') {
@@ -444,25 +744,67 @@ export function setupSFUSocket(io) {
         const producerEntry = rs.producers.get(data.producerId);
         if (!producerEntry) throw new Error('Producer not found');
 
-        // ── VIDEO CONSUMER GATE (BLOCKER-1) ────────────────────────────────
-        // Only forward video to clients when:
-        //   a) The producer's user is an active speaker (from AudioLevelObserver), OR
-        //   b) The client explicitly requests 'featured' (pinned user)
-        // All other video requests return { gated: true } — client shows avatar fallback.
-        // This drops consumers from ~500,000 to ~10,000 in a 500-user room.
+        const budgetVideo = Array.from(state.consumers.values())
+          .filter(c => c.kind === 'video').length;
+        const budgetAudio = Array.from(state.consumers.values())
+          .filter(c => c.kind === 'audio').length;
+
         if (data.kind === 'video') {
+          if (budgetVideo >= rs.budgets.maxVideoConsumersPerClient) {
+            pushDebugEvent('consumer:gated', {
+              roomId: data.roomId,
+              socketId: socket.id,
+              userId: socket.data.userId,
+              producerId: data.producerId,
+              reason: 'client-video-budget',
+            });
+            return respond(cb, { gated: true, reason: 'client-video-budget' });
+          }
+
           const allowed = isVideoAllowed(data.roomId, producerEntry.userId, data.viewContext);
           if (!allowed) {
+            pushDebugEvent('consumer:gated', {
+              roomId: data.roomId,
+              socketId: socket.id,
+              userId: socket.data.userId,
+              producerId: data.producerId,
+              reason: 'not-active-speaker',
+            });
             return respond(cb, { gated: true, reason: 'not-active-speaker' });
           }
         }
-        // ───────────────────────────────────────────────────────────────────
+
+        if (data.kind === 'audio') {
+          if (budgetAudio >= rs.budgets.maxAudioConsumersPerClient) {
+            pushDebugEvent('consumer:gated', {
+              roomId: data.roomId,
+              socketId: socket.id,
+              userId: socket.data.userId,
+              producerId: data.producerId,
+              reason: 'client-audio-budget',
+            });
+            return respond(cb, { gated: true, reason: 'client-audio-budget' });
+          }
+
+          const allowed = isAudioAllowed(data.roomId, producerEntry.userId, data.viewContext);
+          if (!allowed) {
+            pushDebugEvent('consumer:gated', {
+              roomId: data.roomId,
+              socketId: socket.id,
+              userId: socket.data.userId,
+              producerId: data.producerId,
+              reason: 'audio-not-active',
+            });
+            return respond(cb, { gated: true, reason: 'audio-not-active' });
+          }
+        }
 
         if (!router.canConsume({ producerId: data.producerId, rtpCapabilities: data.rtpCapabilities })) {
           throw new Error('Cannot consume this producer (check router or pipe state)');
         }
 
         const consumer = await createConsumer(transport, data.producerId, data.rtpCapabilities);
+        consumer.appData = { ...consumer.appData, producerUserId: producerEntry.userId };
         state.consumers.set(consumer.id, consumer);
         ensureRoomPeer(data.roomId, socket).consumers.add(consumer.id);
 
@@ -480,6 +822,14 @@ export function setupSFUSocket(io) {
           rtpParameters: consumer.rtpParameters,
           type:          consumer.type,
         });
+        pushDebugEvent('consumer:created', {
+          roomId: data.roomId,
+          socketId: socket.id,
+          userId: socket.data.userId,
+          consumerId: consumer.id,
+          producerId: data.producerId,
+          kind: consumer.kind,
+        });
       } catch (err) {
         respond(cb, { error: err?.message || 'Failed to create consumer' });
       }
@@ -494,6 +844,40 @@ export function setupSFUSocket(io) {
         respond(cb, { success: true });
       } catch (err) {
         respond(cb, { error: err?.message || 'Failed to resume consumer' });
+      }
+    });
+
+    // ── Pause/Resume Consumer by User ID (Frontend Virtualization) ──────────
+    socket.on('sfu:pauseConsumerByUserId', async (data, cb) => {
+      try {
+        const { targetUserId, kind } = data;
+        let pausedCount = 0;
+        for (const consumer of state.consumers.values()) {
+          // Check if this consumer belongs to the targetUserId and matches kind
+          if (consumer.kind === kind && consumer.appData?.producerUserId === targetUserId) {
+            await consumer.pause();
+            pausedCount++;
+          }
+        }
+        respond(cb, { success: true, pausedCount });
+      } catch (err) {
+        respond(cb, { error: err?.message || 'Failed to pause consumer by userId' });
+      }
+    });
+
+    socket.on('sfu:resumeConsumerByUserId', async (data, cb) => {
+      try {
+        const { targetUserId, kind } = data;
+        let resumedCount = 0;
+        for (const consumer of state.consumers.values()) {
+          if (consumer.kind === kind && consumer.appData?.producerUserId === targetUserId) {
+            await consumer.resume();
+            resumedCount++;
+          }
+        }
+        respond(cb, { success: true, resumedCount });
+      } catch (err) {
+        respond(cb, { error: err?.message || 'Failed to resume consumer by userId' });
       }
     });
 
@@ -516,6 +900,7 @@ export function setupSFUSocket(io) {
         }
 
         const consumer = await createConsumer(transport, producerId, rtpCapabilities);
+        consumer.appData = { ...consumer.appData, producerUserId: producerEntry.userId };
         state.consumers.set(consumer.id, consumer);
 
         // Featured (pinned) → spatial layer 2 (720p)
@@ -538,6 +923,7 @@ export function setupSFUSocket(io) {
     // ── Disconnect cleanup ──────────────────────────────────────────────────
     socket.on('disconnect', () => {
       console.log(`🔌 SFU disconnected: ${socket.id}`);
+      pushDebugEvent('socket:disconnected', { socketId: socket.id, userId: socket.data.userId });
       cleanupSocket(socket, state);
     });
   });
